@@ -108,7 +108,11 @@ class StructuredXML(BaseModel):
                 return items
             else:
                 # For primitive types in a list
-                if ',' in value:
+                # First check for li tags
+                li_items = re.findall(r'<li>(.*?)</li>', value)
+                if li_items:
+                    return [cls._parse_primitive(item.strip(), item_type) for item in li_items]
+                elif ',' in value:
                     # Assume comma-separated values
                     return [cls._parse_primitive(item.strip(), item_type) for item in value.split(',')]
                 else:
