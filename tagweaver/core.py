@@ -216,6 +216,80 @@ class StructuredXML(BaseModel):
         # Return the schema with proper indentation
         tag_name = cls._get_tag_name(cls)
         return f"<{tag_name}>\n{indent_str}{f'\n{indent_str}'.join(schema_lines)}\n</{tag_name}>"
+
+    def to_xml(self, pretty: bool = False, indent_spaces: int = 2) -> str:
+        """Convert the model instance to an XML string.
+        
+        Args:
+            pretty: Whether to format the XML with proper indentation
+            indent_spaces: Number of spaces for indentation when pretty=True
+            
+        Returns:
+            Formatted XML string representation of the model
+        """
+        # Get the root tag name for this class
+        root_tag = self._get_tag_name(self.__class__)
+        
+        # Create the root element
+        root = ET.Element(root_tag)
+        
+        # Add all fields as child elements
+        for field_name, field_value in self.model_dump().items():
+            if field_value is None:
+                continue
+                
+            # Convert snake_case to kebab-case for XML
+            xml_tag = field_name.replace('_', '-')
+            
+            # Handle different types of values
+            self._add_field_to_element(root, xml_tag, field_value)
+        
+        # Convert to string
+        xml_str = ET.tostring(root, encoding='unicode')
+        
+        # Pretty print if requested
+        if pretty:
+            dom = parseString(xml_str)
+            xml_str = dom.toprettyxml(indent=' ' * indent_spaces)
+            # Remove the XML declaration
+            xml_str = '\n'.join(xml_str.split('\n')[1:])
+        
+        return xml_str
+
+    def _add_field_to_element(self, parent: ET.Element, tag: str, value: Any) -> None:
+        """Add a field to an XML element based on its type."""
+        # Handle None values
+        if value is None:
+            return
+            
+        # Handle lists
+        if isinstance(value, list):
+            element = ET.SubElement(parent, tag)
+            for item in value:
+                if isinstance(item, StructuredXML):
+                    # For nested StructuredXML objects in a list
+                    item_tag = self._get_tag_name(item.__class__)
+                    item_element = ET.SubElement(element, item_tag)
+                    # Add all fields from the nested object
+                    for sub_field, sub_value in item.model_dump().items():
+                        if sub_value is not None:
+                            self._add_field_to_element(item_element, sub_field.replace('_', '-'), sub_value)
+                else:
+                    # For primitive types in a list
+                    item_element = ET.SubElement(element, 'item')
+                    item_element.text = str(item)
+        
+        # Handle nested StructuredXML objects
+        elif isinstance(value, StructuredXML):
+            element = ET.SubElement(parent, tag)
+            for sub_field, sub_value in value.model_dump().items():
+                if sub_value is not None:
+                    self._add_field_to_element(element, sub_field.replace('_', '-'), sub_value)
+        
+        # Handle primitive types
+        else:
+            element = ET.SubElement(parent, tag)
+            element.text = str(value)
     
     @field_validator('*', mode='before')
     @classmethod
