@@ -1,325 +1,402 @@
 import re
-from textwrap import indent
 import xml.etree.ElementTree as ET
 from xml.dom.minidom import parseString
-from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Any, ClassVar, Dict, List, Optional, Type, TypeVar, get_origin, get_args, Union
-
+from pydantic import BaseModel, Field
+from typing import Any, ClassVar, Dict, List, Optional, Type, TypeVar, get_origin, get_args, Union, ForwardRef
 
 T = TypeVar('T', bound='StructuredXML')
 
+# =============================================================================
+# StructuredXML Class for XML <-> Pydantic Model Handling
+# =============================================================================
 
 class StructuredXML(BaseModel):
-    """Base class for parsing XML content into Pydantic models."""
-    
-    # Class variable for custom field parsers
-    _custom_parsers: ClassVar[Dict[str, callable]] = {}
-    
+    """
+    Base class for Pydantic models that can generate XML schema templates,
+    parse XML strings into model instances, and serialize instances to XML.
+
+    Uses Pydantic field definitions for structure, types, and descriptions.
+    XML tags directly correspond to Pydantic field names.
+    """
+
+    # Class variable to track forward references during schema generation
+    _building_schema_for: ClassVar[set] = set()
+
     @classmethod
-    def extract_xml(cls, xml_string: str, tag: str, multiple: bool = False) -> Any:
-        """Extract content between XML tags."""
-        pattern = fr'(?s)<{tag}>(.*?)</{tag}>'
-        
-        if multiple:
-            matches = re.finditer(pattern, xml_string)
-            return [match.group(1).strip() for match in matches] if matches else []
-        
-        match = re.search(pattern, xml_string)
-        return match.group(1).strip() if match else None
-    
+    def _get_model_root_tag(cls) -> str:
+        """Gets the root tag name for the model (defaults to class name)."""
+        return getattr(cls, '__xml_root_tag__', cls.__name__)
+
     @classmethod
-    def clean_xml(cls, xml_string: str) -> str:
-        """Remove markdown code blocks and other formatting."""
-        if not xml_string:
-            return ""
-        cleaned = re.sub(r'```\w*\n?', '', xml_string)
-        return cleaned.replace('```', '').replace('`', '')
-    
-    @classmethod
-    def parse_xml(cls: Type[T], xml_string: str, clean_markdown: bool = False) -> T:
-        """Parse XML string into model instance."""
-        if clean_markdown: 
-            xml_string = cls.clean_xml(xml_string)
-        data = {}
-        
-        # Get field info from model
-        for field_name, field_info in cls.model_fields.items():
-            # Convert field_name from snake_case to kebab-case for XML tags
-            xml_tag = field_name.replace('_', '-')
-            field_type = field_info.annotation
-            
-            # Check for custom parser first
-            if field_name in cls._custom_parsers:
-                data[field_name] = cls._custom_parsers[field_name](xml_string, xml_tag)
-                continue
-            
-            # Extract the raw value
-            raw_value = cls.extract_xml(xml_string, xml_tag)
-            if raw_value is None:
-                continue
-                
-            # Handle different types
-            try:
-                data[field_name] = cls._parse_field_value(raw_value, field_type, xml_tag)
-            except Exception as e:
-                # If parsing fails, use default or None
-                continue
-        
-        # Create the model instance
-        return cls(**data)
-    
-    @classmethod
-    def _parse_field_value(cls, value: str, field_type: Type, xml_tag: str) -> Any:
-        """Parse a value according to its field type."""
-        # Handle None
-        if value is None:
-            return None
-            
-        # Get origin type and args for generics
-        origin = get_origin(field_type)
-        args = get_args(field_type)
-        
-        # Handle Optional types
-        if origin is Union and type(None) in args:
-            inner_type = next(arg for arg in args if arg is not type(None))
-            return cls._parse_field_value(value, inner_type, xml_tag)
-        
-        # Handle lists
-        if origin is list:
-            item_type = args[0] if args else Any
-            # Check if items are wrapped in their own tags
-            if issubclass(item_type, StructuredXML):
-                # For nested structured objects in a list
-                items = []
-                # Try to extract items with an item-specific tag
-                item_tag = item_type.__name__.lower().replace('_', '-')
-                item_texts = cls.extract_xml(value, item_tag, multiple=True)
-                
-                # If no items found with specific tag, try generic 'item' tag
-                if not item_texts:
-                    item_texts = cls.extract_xml(value, 'item', multiple=True)
-                
-                # If still no items, treat the whole value as one item
-                if not item_texts:
-                    item_texts = [value]
-                
-                for item_text in item_texts:
-                    items.append(item_type.parse_xml(item_text))
-                return items
-            else:
-                # For primitive types in a list
-                # First check for li tags
-                li_items = re.findall(r'<li>(.*?)</li>', value)
-                if li_items:
-                    return [cls._parse_primitive(item.strip(), item_type) for item in li_items]
-                elif ',' in value:
-                    # Assume comma-separated values
-                    return [cls._parse_primitive(item.strip(), item_type) for item in value.split(',')]
-                else:
-                    # Might be newline-separated
-                    return [cls._parse_primitive(item.strip(), item_type) for item in value.split('\n') if item.strip()]
-        
-        # Handle nested StructuredXML objects
-        if isinstance(field_type, type) and issubclass(field_type, StructuredXML):
-            return field_type.parse_xml(value)
-        
-        # Handle primitive types
-        return cls._parse_primitive(value, field_type)
-    
-    @classmethod
-    def _parse_primitive(cls, value: str, field_type: Type) -> Any:
-        """Parse primitive values."""
-        if field_type is str:
-            return value
-        elif field_type is int:
-            return int(value)
-        elif field_type is float:
-            return float(value)
-        elif field_type is bool:
-            return value.lower() in ('true', 'yes', '1', 'y')
+    def _get_list_item_tag(cls, item_type: Type) -> str:
+        """Determines the tag name for items within a list."""
+        if isinstance(item_type, type) and issubclass(item_type, StructuredXML):
+             return item_type._get_model_root_tag()
         else:
-            # Fall back to string
-            return value
-    
+            return "item"
+
+    # --- XML Schema Generation ---
+
     @classmethod
-    def register_parser(cls, field_name: str, parser_func: callable):
-        """Register a custom parser for a field."""
-        cls._custom_parsers[field_name] = parser_func
-    
-    @classmethod
-    def xml_schema(cls, indent_level: int = 0) -> str:
-        """Generate XML schema representation of the model.
-        
-        This creates a template showing the expected XML structure with
-        field descriptions from the Pydantic model's Field descriptions.
+    def xml_schema(cls, indent_spaces: int = 4) -> str:
         """
-        schema_lines = []
-        indent_str = ' ' * 4
-        
-        for field_name, field_info in cls.model_fields.items():
-            # Convert field_name from snake_case to kebab-case for XML tags
-            xml_tag = field_name.replace('_', '-')
+        Generate an example XML structure template based on the Pydantic model.
+
+        Args:
+            indent_spaces: Number of spaces for indentation.
+
+        Returns:
+            A formatted XML string representing the model's structure.
+        """
+        root_tag = cls._get_model_root_tag()
+
+        if root_tag in cls._building_schema_for:
+            return f"<{root_tag}><!-- Recursive reference to {root_tag} --></{root_tag}>"
+
+        cls._building_schema_for.add(root_tag)
+
+        try:
+            root = ET.Element(root_tag)
+            cls._build_schema_element(root, cls)
+
+            rough_string = ET.tostring(root, encoding='unicode')
+            dom = parseString(rough_string)
+            pretty_xml = dom.toprettyxml(indent=" " * indent_spaces)
+            pretty_xml = '\n'.join(pretty_xml.split('\n')[1:]) # Remove declaration
+            pretty_xml = pretty_xml.strip() + '\n'
+            return pretty_xml
+
+        finally:
+            cls._building_schema_for.remove(root_tag)
+
+
+    @classmethod
+    def _build_schema_element(cls, parent_element: ET.Element, model_type: Type['StructuredXML']):
+        """Recursively build the XML schema structure using ElementTree."""
+        for field_name, field_info in model_type.model_fields.items():
             field_type = field_info.annotation
-            
-            # Get field description if available
-            field_description = field_info.description or f"The {field_name} field"
-            
-            # Handle different field types
+            description = field_info.description or f"Field '{field_name}'"
+            comment_text = f" {description} "
+
             origin = get_origin(field_type)
             args = get_args(field_type)
-            
-            # Handle Optional types
-            if origin is Union and type(None) in args:
-                inner_type = next(arg for arg in args if arg is not type(None))
-                field_type = inner_type
-                origin = get_origin(inner_type)
-                args = get_args(inner_type)
-            
-            # Handle lists
-            if origin is list:
+            is_optional = False
+
+            if origin is Union:
+                union_args = [arg for arg in args if arg is not type(None)]
+                if len(union_args) == 1 and type(None) in args:
+                    field_type = union_args[0]
+                    origin = get_origin(field_type)
+                    args = get_args(field_type)
+                    is_optional = True
+
+            if isinstance(field_type, ForwardRef):
+                 try:
+                     global_ns = model_type.__module__.__dict__
+                     local_ns = dict(vars(model_type))
+                     field_type = field_type._evaluate(global_ns, local_ns, set())
+                     origin = get_origin(field_type)
+                     args = get_args(field_type)
+                 except NameError:
+                     el = ET.SubElement(parent_element, field_name)
+                     el.append(ET.Comment(f" Type '{field_info.annotation}' (unresolved ForwardRef) - {description} "))
+                     continue
+
+            # Handle Lists
+            if origin is list or origin is List:
+                list_element = ET.SubElement(parent_element, field_name)
+                list_element.append(ET.Comment(comment_text))
                 item_type = args[0] if args else Any
-                schema_lines.append(f"<{xml_tag}>")
-                schema_lines.append(f"{indent_str}<!-- {field_description} -->")
-                
-                if issubclass(item_type, StructuredXML):
-                    # For lists of structured objects
-                    item_tag = item_type.__name__.lower().replace('_', '-')
-                    item_schema = item_type.xml_schema(indent_level=1)
-                    # Indent the nested schema
-                    indented_schema = indent(item_schema, indent_str)
-                    schema_lines.append(indented_schema)
+
+                if item_type is Any:
+                     item_element = ET.SubElement(list_element, "item")
+                     item_element.append(ET.Comment(" Generic list item "))
+                elif isinstance(item_type, type) and issubclass(item_type, StructuredXML):
+                     item_tag = item_type._get_model_root_tag()
+                     list_element.append(ET.Comment(f" Contains <{item_tag}> elements "))
+                     item_element = ET.Element(item_tag)
+                     cls._build_schema_element(item_element, item_type)
+                     list_element.append(item_element)
                 else:
-                    # For lists of primitive types
-                    schema_lines.append(f"{indent_str}<li><!-- List item 1 of type {item_type.__name__} --></li>")
-                    schema_lines.append(f"{indent_str}<li><!-- List item 2 of type {item_type.__name__} --></li>")
-                    schema_lines.append(f"{indent_str}...")
-                
-                schema_lines.append(f"</{xml_tag}>")
-            
-            # Handle nested StructuredXML objects
+                    item_tag = cls._get_list_item_tag(item_type)
+                    item_element = ET.SubElement(list_element, item_tag)
+                    item_element.append(ET.Comment(f" Example item of type {item_type.__name__} "))
+
+            # Handle Nested StructuredXML Models
             elif isinstance(field_type, type) and issubclass(field_type, StructuredXML):
-                schema_lines.append(f"<{xml_tag}>")
-                schema_lines.append(f"{indent_str}<!-- {field_description} -->")
-                
-                # Get the nested schema
-                nested_schema = field_type.xml_schema(indent_level=1)
-                # Indent the nested schema
-                indented_schema = indent(nested_schema, indent_str)
-                schema_lines.append(indented_schema)
-                
-                schema_lines.append(f"</{xml_tag}>")
-            
-            # Handle primitive types
-            else:
-                schema_lines.append(f"<{xml_tag}><!-- {field_description} --></{xml_tag}>")
-        
-        # Return the schema with proper indentation
-        tag_name = cls._get_tag_name(cls)
-        return f"<{tag_name}>\n{indent_str}{f'\n{indent_str}'.join(schema_lines)}\n</{tag_name}>"
+                nested_element = ET.SubElement(parent_element, field_name)
+                nested_element.append(ET.Comment(comment_text))
+                cls._build_schema_element(nested_element, field_type)
 
-    def to_xml(self, pretty: bool = False, indent_spaces: int = 2) -> str:
-        """Convert the model instance to an XML string.
-        
-        Args:
-            pretty: Whether to format the XML with proper indentation
-            indent_spaces: Number of spaces for indentation when pretty=True
-            
-        Returns:
-            Formatted XML string representation of the model
+            # Handle Primitive Types
+            else:
+                primitive_element = ET.SubElement(parent_element, field_name)
+                primitive_element.append(ET.Comment(comment_text))
+
+    # --- XML Parsing ---
+
+    @classmethod
+    def parse_xml(cls: Type[T], xml_string: str) -> T:
         """
-        # Get the root tag name for this class
-        root_tag = self._get_tag_name(self.__class__)
-        
-        # Create the root element
-        root = ET.Element(root_tag)
-        
-        # Add all fields as child elements
-        for field_name, field_value in self.model_dump().items():
-            if field_value is None:
-                continue
-                
-            # Convert snake_case to kebab-case for XML
-            xml_tag = field_name.replace('_', '-')
-            
-            # Handle different types of values
-            self._add_field_to_element(root, xml_tag, field_value)
-        
-        # Convert to string
-        xml_str = ET.tostring(root, encoding='unicode')
-        
-        # Pretty print if requested
-        if pretty:
-            dom = parseString(xml_str)
-            xml_str = dom.toprettyxml(indent=' ' * indent_spaces)
-            # Remove the XML declaration
-            xml_str = '\n'.join(xml_str.split('\n')[1:])
-        
-        return xml_str
+        Parses an XML string into an instance of this Pydantic model.
+        Args:
+            xml_string: The XML string to parse.
+        Returns:
+            An instance of the model populated with data from the XML.
+        Raises:
+            ValueError: If the XML is malformed or doesn't match the expected structure.
+            pydantic.ValidationError: If the extracted data fails Pydantic validation.
+        """
+        try:
+            cleaned_xml = re.sub(r'```xml\n?', '', xml_string, flags=re.IGNORECASE)
+            cleaned_xml = cleaned_xml.replace('```', '').strip()
+            if not cleaned_xml:
+                raise ValueError("Input XML string is empty after cleaning")
+            root_element = ET.fromstring(cleaned_xml)
+        except ET.ParseError as e:
+            raise ValueError(f"Invalid XML format: {e}") from e
+        except Exception as e:
+             raise ValueError(f"Error preparing XML for parsing: {e}") from e
 
-    def _add_field_to_element(self, parent: ET.Element, tag: str, value: Any) -> None:
-        """Add a field to an XML element based on its type."""
-        # Handle None values
-        if value is None:
-            return
-            
-        # Handle lists
-        if isinstance(value, list):
-            element = ET.SubElement(parent, tag)
-            for item in value:
-                if isinstance(item, StructuredXML):
-                    # For nested StructuredXML objects in a list
-                    item_tag = self._get_tag_name(item.__class__)
-                    item_element = ET.SubElement(element, item_tag)
-                    # Add all fields from the nested object
-                    for sub_field, sub_value in item.model_dump().items():
-                        if sub_value is not None:
-                            self._add_field_to_element(item_element, sub_field.replace('_', '-'), sub_value)
-                else:
-                    # For primitive types in a list
-                    item_element = ET.SubElement(element, 'item')
-                    item_element.text = str(item)
-        
-        # Handle nested StructuredXML objects
-        elif isinstance(value, StructuredXML):
-            element = ET.SubElement(parent, tag)
-            for sub_field, sub_value in value.model_dump().items():
-                if sub_value is not None:
-                    self._add_field_to_element(element, sub_field.replace('_', '-'), sub_value)
-        
-        # Handle primitive types
-        else:
-            element = ET.SubElement(parent, tag)
-            element.text = str(value)
-    
-    @field_validator('*', mode='before')
-    @classmethod
-    def empty_str_to_none(cls, value: Any, info):
-        """Convert empty strings to None."""
-        if value == "":
-            return None
-        return value
+        expected_root_tag = cls._get_model_root_tag()
+        if root_element.tag != expected_root_tag:
+            raise ValueError(f"Expected root tag '<{expected_root_tag}>' but found '<{root_element.tag}>'")
+
+        data = cls._parse_element_to_dict(root_element, cls)
+        # Use Pydantic's model_validate to handle validation and instantiation
+        # return cls(**data) # Old way
+        return cls.model_validate(data) # Preferred Pydantic v2 way
 
     @classmethod
-    def _get_tag_name(cls, class_type: Type) -> str:
-        if hasattr(class_type, '__tagname__'):
-            return class_type.__tagname__
+    def _parse_element_to_dict(cls, element: ET.Element, model_type: Type['StructuredXML']) -> Dict[str, Any]:
+        """Recursively parses an XML element into a dictionary based on the model."""
+        data: Dict[str, Any] = {}
+        children_by_tag: Dict[str, List[ET.Element]] = {}
+        for child in element:
+            if isinstance(child.tag, str):
+                 children_by_tag.setdefault(child.tag, []).append(child)
 
-        class_name = class_type.__name__
-        
-        result = ""
-        prev_is_upper = False
-        
-        for i, char in enumerate(class_name):
-            if char.isupper():
-                if i > 0 and not prev_is_upper:
-                    result += "-"
-                result += char.lower()
-                prev_is_upper = True
+        for field_name, field_info in model_type.model_fields.items():
+            field_type = field_info.annotation
+
+            origin = get_origin(field_type)
+            args = get_args(field_type)
+            is_optional = False
+
+            if origin is Union:
+                union_args = [arg for arg in args if arg is not type(None)]
+                if len(union_args) == 1 and type(None) in args:
+                    field_type = union_args[0]
+                    origin = get_origin(field_type)
+                    args = get_args(field_type)
+                    is_optional = True
+
+            if isinstance(field_type, ForwardRef):
+                 try:
+                     global_ns = model_type.__module__.__dict__
+                     local_ns = dict(vars(model_type)) # May need model_type's __dict__ depending on where Ref is defined
+                     field_type = field_type._evaluate(global_ns, local_ns or None, set()) # Add recursive_guard
+                     origin = get_origin(field_type)
+                     args = get_args(field_type)
+                 except NameError as e:
+                      print(f"Warning: Could not resolve ForwardRef '{field_info.annotation}' for field '{field_name}'. Skipping field. Error: {e}")
+                      continue
+
+            child_elements = children_by_tag.get(field_name)
+            if not child_elements:
+                continue # Let Pydantic handle missing fields (default/required)
+
+            # Handle Lists
+            if origin is list or origin is List:
+                item_type = args[0] if args else Any
+                parsed_list = []
+                list_container_element = child_elements[0] # Assume first element is the container
+
+                if item_type is Any:
+                     # Treat children as strings if type is Any
+                     parsed_list = [child.text.strip() if child.text else None for child in list_container_element]
+                elif isinstance(item_type, type) and issubclass(item_type, StructuredXML):
+                    item_tag = item_type._get_model_root_tag()
+                    list_item_elements = list_container_element.findall(item_tag)
+                    for item_element in list_item_elements:
+                         parsed_list.append(cls._parse_element_to_dict(item_element, item_type))
+                else: # Primitive list items
+                    item_tag = cls._get_list_item_tag(item_type)
+                    list_item_elements = list_container_element.findall(item_tag)
+                    for item_element in list_item_elements:
+                        value_str = item_element.text.strip() if item_element.text else ""
+                        # Parse non-empty strings or if the item itself might be optional (complex case)
+                        # Let Pydantic handle validation of the parsed value (or None)
+                        if value_str or item_type is type(None) or get_origin(item_type) is Union: # Attempt parse if non-empty or potentially optional type
+                            try:
+                                parsed_list.append(cls._parse_primitive(value_str, item_type))
+                            except ValueError:
+                                # If primitive parse fails, pass raw string to Pydantic
+                                parsed_list.append(value_str)
+                        else:
+                             # Empty tag for a non-optional primitive type - Pydantic should catch this
+                             # Pass the empty string for validation.
+                              parsed_list.append(value_str)
+
+
+                data[field_name] = parsed_list
+
+            # Handle Nested StructuredXML Models (non-list)
+            elif isinstance(field_type, type) and issubclass(field_type, StructuredXML):
+                if len(child_elements) > 1:
+                     print(f"Warning: Found multiple <{field_name}> elements for non-list field. Using the first one.")
+                nested_element = child_elements[0]
+                data[field_name] = cls._parse_element_to_dict(nested_element, field_type)
+
+            # Handle Primitive Types (non-list)
             else:
-                result += char
-                prev_is_upper = False
-        return result.replace('_', '-')
+                if len(child_elements) > 1:
+                     print(f"Warning: Found multiple <{field_name}> elements for non-list primitive field. Using the first one.")
+                primitive_element = child_elements[0]
+                value_str = primitive_element.text.strip() if primitive_element.text else ""
+                # Always pass the value string (even if empty) to Pydantic validation
+                # Pydantic handles required/optional/default logic based on the raw value.
+                try:
+                    # Attempt primitive conversion, but pass raw string if it fails
+                    data[field_name] = cls._parse_primitive(value_str, field_type)
+                except ValueError:
+                    data[field_name] = value_str # Let Pydantic validate the raw string
 
+        return data
+
+    @classmethod
+    def _parse_primitive(cls, value: str, field_type: Type) -> Any:
+        """Parses a string value into a primitive Python type. Returns raw string if specific type fails."""
+        value = value.strip()
+        # Handle target None type explicitly if needed
+        if field_type is type(None):
+             return None if not value else value # Return None if empty, else original string?
+
+        # If value is empty string, return it directly for Pydantic to handle based on Optional/default
+        if not value:
+             return value
+
+        # Attempt specific type conversions
+        try:
+            if field_type is str: return value
+            if field_type is int: return int(value)
+            if field_type is float: return float(value)
+            if field_type is bool: return value.lower() in ('true', 'yes', '1', 'y')
+            # Fallback for other types (enums, dates handled by Pydantic)
+            return value
+        except (ValueError, TypeError):
+             # If direct conversion fails, return the original string
+             # Pydantic's validation might still be able to parse it (e.g., for dates, enums)
+             return value
+
+
+    # --- XML Serialization ---
+
+    def to_xml(self, pretty: bool = False, indent_spaces: int = 4) -> str:
+        """
+        Serializes this Pydantic model instance into an XML string.
+
+        Args:
+            pretty: If True, format the XML with indentation and newlines.
+            indent_spaces: Number of spaces for indentation when pretty=True.
+
+        Returns:
+            An XML string representation of the model instance.
+        """
+        root_tag = self._get_model_root_tag()
+        root = ET.Element(root_tag)
+        model_data = self.model_dump(mode='python', by_alias=False)
+        self._add_fields_to_element(root, model_data, self.__class__)
+
+        rough_string = ET.tostring(root, encoding='unicode')
+
+        if pretty:
+            try:
+                dom = parseString(rough_string)
+                pretty_xml = dom.toprettyxml(indent=" " * indent_spaces)
+                pretty_xml = '\n'.join(pretty_xml.split('\n')[1:])
+                pretty_xml = pretty_xml.strip() + '\n'
+                return pretty_xml
+            except Exception as e:
+                 print(f"Warning: Failed to pretty-print XML, returning raw string. Error: {e}")
+                 return rough_string
+        else:
+            return rough_string
+
+    def _add_fields_to_element(self, parent_element: ET.Element, data: Dict[str, Any], model_type: Type['StructuredXML']):
+        """Recursively adds fields from data dict to XML element based on model type."""
+        for field_name, field_value in data.items():
+            if field_value is None:
+                continue # Skip None values
+
+            field_info = model_type.model_fields.get(field_name)
+            if not field_info: continue
+
+            field_type = field_info.annotation
+            origin = get_origin(field_type)
+            args = get_args(field_type)
+
+            if origin is Union:
+                union_args = [arg for arg in args if arg is not type(None)]
+                if len(union_args) == 1 and type(None) in args:
+                    field_type = union_args[0]
+                    origin = get_origin(field_type)
+                    args = get_args(field_type)
+
+            if isinstance(field_type, ForwardRef):
+                 try:
+                     global_ns = model_type.__module__.__dict__
+                     local_ns = dict(vars(model_type))
+                     field_type = field_type._evaluate(global_ns, local_ns or None, set())
+                     origin = get_origin(field_type)
+                     args = get_args(field_type)
+                 except NameError:
+                      print(f"Warning: Could not resolve ForwardRef for serialization: {field_info.annotation}. Skipping field '{field_name}'.")
+                      continue
+
+            # Handle Lists
+            if isinstance(field_value, list):
+                list_element = ET.SubElement(parent_element, field_name)
+                item_type = args[0] if args else Any
+                for item in field_value:
+                    if item is None: continue
+
+                    item_model_type = None
+                    # Determine the actual type of the item for tag generation/recursion
+                    if isinstance(item, StructuredXML):
+                         item_model_type = item.__class__
+                    elif isinstance(item_type, type) and issubclass(item_type, StructuredXML):
+                         item_model_type = item_type # Use the declared list item type
+
+                    if item_model_type:
+                         # Item is a nested model (either directly or via type hint)
+                         item_tag = item_model_type._get_model_root_tag()
+                         item_element = ET.SubElement(list_element, item_tag)
+                         # Get item data (handle if it's already a model or still a dict)
+                         item_data = item.model_dump(mode='python', by_alias=False) if isinstance(item, StructuredXML) else item
+                         self._add_fields_to_element(item_element, item_data, item_model_type)
+                    else:
+                         # Item is primitive
+                         item_tag = self._get_list_item_tag(item_type) # Use hinted type for tag name
+                         item_element = ET.SubElement(list_element, item_tag)
+                         item_element.text = str(item)
+
+            # Handle Nested StructuredXML Models (or dicts matching model type)
+            elif isinstance(field_value, StructuredXML) or (isinstance(field_value, dict) and isinstance(field_type, type) and issubclass(field_type, StructuredXML)):
+                 nested_model_type = field_value.__class__ if isinstance(field_value, StructuredXML) else field_type
+                 nested_element = ET.SubElement(parent_element, field_name)
+                 nested_data = field_value.model_dump(mode='python', by_alias=False) if isinstance(field_value, StructuredXML) else field_value
+                 self._add_fields_to_element(nested_element, nested_data, nested_model_type)
+
+            # Handle Primitive Types
+            else:
+                element = ET.SubElement(parent_element, field_name)
+                element.text = str(field_value)
+
+
+# =============================================================================
+# Instruction Template Classes
+# =============================================================================
 
 class SubList(BaseModel):
     """A header with a nested list of items"""
@@ -336,7 +413,7 @@ class InstructionTemplate(BaseModel):
     """Template for generating structured instruction prompts for language models"""
     # Core components
     task: str = Field(..., description="Main instruction describing what the model should do")
-    
+
     # Optional components
     context: Optional[str] = Field(None, description="Background information or scenario details")
     response_schema: Optional[Union[StructuredXML, Type[StructuredXML], str]] = Field(None, description="Expected output format (XML schema or description)")
@@ -344,53 +421,69 @@ class InstructionTemplate(BaseModel):
     examples: Optional[List[Example]] = Field(None, description="Few-shot learning examples")
     tone: Optional[str] = Field(None, description="Desired tone for the response")
     note: Optional[str] = Field(None, description="Additional notes or reminders")
-    
+
     # Customization options
     custom_sections: Optional[Dict[str, str]] = Field(None, description="Additional custom sections")
     sections_order: Optional[List[str]] = Field(None, description="Custom ordering of sections")
     variables: Optional[Dict[str, Any]] = Field(None, description="Template variables for substitution")
-    
+
     def render(self, **extra_vars) -> str:
         """Render the instruction template as a complete prompt string"""
-        # Combine default and provided variables
         all_vars = {**(self.variables or {}), **extra_vars}
-        
-        # Default section order if not specified
         section_order = self.sections_order or [
-            "task", "context", "response_schema", "guidelines", 
+            "task", "context", "response_schema", "guidelines",
             "examples", "tone", "custom_sections", "note"
         ]
-        
+
         sections = []
-        for section in section_order:
-            rendered = self._render_section(section, all_vars)
+        for section_name in section_order:
+            # Allow referencing custom sections by name in the order list
+            if section_name in (self.custom_sections or {}):
+                 rendered = self._render_custom_section(section_name, vars=all_vars)
+            else:
+                 rendered = self._render_section(section_name, vars=all_vars)
+
             if rendered:
                 sections.append(rendered)
-        
-        # Join sections and apply final variable substitution
+
         prompt = "\n\n".join(sections)
-        return self._substitute_variables(prompt, all_vars)
-    
+        # Final substitution pass on the whole prompt (optional, handles variables in headers/titles)
+        # return self._substitute_variables(prompt, all_vars)
+        return prompt # Substitution is done per-section, avoid double-substituting
+
+
     def _render_section(self, section: str, vars: Dict[str, Any]) -> Optional[str]:
-        """Render a specific section with variable substitution"""
+        """Render a specific built-in section with variable substitution"""
+        rendered_content = None
+
         if section == "task" and self.task:
-            return self._substitute_variables(self.task, vars)
-            
+            rendered_content = self._substitute_variables(self.task, vars)
+
         elif section == "context" and self.context:
             context = self._substitute_variables(self.context, vars)
-            return f"# Context:\n{context}"
-            
+            rendered_content = f"# Context:\n{context}"
+
         elif section == "response_schema" and self.response_schema:
+            schema_str = ""
+            # Check if it's a StructuredXML CLASS
             if isinstance(self.response_schema, type) and issubclass(self.response_schema, StructuredXML):
-                schema = self.response_schema.xml_schema(indent_level=2)
-                return f"# Generate your response in the following XML format:\n\n```xml\n{schema}\n```"
-            elif hasattr(self.response_schema, 'xml_schema'):
-                schema = self.response_schema.xml_schema(indent_level=2)
-                return f"# Generate your response in the following XML format:\n\n```xml\n{schema}\n```"
+                # Use the xml_schema classmethod with correct argument name
+                schema_str = self.response_schema.xml_schema(indent_spaces=2)
+            # Check if it's a StructuredXML INSTANCE (less common for schema)
+            elif isinstance(self.response_schema, StructuredXML):
+                # Use the xml_schema classmethod via the instance's class
+                schema_str = self.response_schema.__class__.xml_schema(indent_spaces=2)
+            # Fallback to string representation
             else:
-                schema = self._substitute_variables(str(self.response_schema), vars)
-                return f"# Response Format:\n{schema}"
-                
+                schema_str = self._substitute_variables(str(self.response_schema), vars)
+
+            # Format based on whether it looks like XML or not
+            if schema_str.strip().startswith('<') and schema_str.strip().endswith('>'):
+                 rendered_content = f"# Generate your response in the following XML format:\n\n```xml\n{schema_str}```"
+            else:
+                 rendered_content = f"# Response Format:\n{schema_str}"
+
+
         elif section == "guidelines" and self.guidelines:
             result = "# Guidelines:"
             for i, guideline in enumerate(self.guidelines, 1):
@@ -399,51 +492,69 @@ class InstructionTemplate(BaseModel):
                     result += f"\n{i}. {text}"
                 elif isinstance(guideline, SubList):
                     header = self._substitute_variables(guideline.header, vars)
-                    result += f"\n{i}. {header}"
+                    result += f"\n{i}. {header}:" # Added colon for clarity
                     for item in guideline.items:
                         item_text = self._substitute_variables(item, vars)
                         result += f"\n   - {item_text}"
-            return result
-            
+            rendered_content = result
+
         elif section == "examples" and self.examples:
-            result = "# Example Inputs and Outputs:"
+            result = "# Examples:" # Changed header slightly
             for i, example in enumerate(self.examples, 1):
-                result += f"\n## Example {i}:"
+                result += f"\n\n## Example {i}"
                 input_text = self._substitute_variables(example.input, vars)
                 output_text = self._substitute_variables(example.output, vars)
-                result += f"\nInput: {input_text}"
-                result += f"\nOutput: {output_text}"
+                result += f"\nInput:\n```\n{input_text}\n```" # Wrap in code blocks maybe?
+                result += f"\nOutput:\n```xml\n{output_text}\n```" # Assuming XML output for examples
                 if example.explanation:
                     explanation = self._substitute_variables(example.explanation, vars)
-                    result += f"\n\n> Note: Explanation: {explanation}"
-            return result
-            
+                    result += f"\n\n> Explanation: {explanation}" # Simpler note format
+            rendered_content = result
+
         elif section == "tone" and self.tone:
             tone = self._substitute_variables(self.tone, vars)
-            return f"\n\n# Tone:\n{tone}"
-            
+            rendered_content = f"# Tone:\n{tone}"
+
         elif section == "note" and self.note:
             note = self._substitute_variables(self.note, vars)
-            return f"\n# Note: \n{note}"
-            
+            rendered_content = f"# Note:\n{note}" # Consistent header casing
+
+        # This handles the "custom_sections" key if it's listed explicitly
+        # in sections_order, rendering all custom sections together.
         elif section == "custom_sections" and self.custom_sections:
             custom_parts = []
+            # Render only those custom sections NOT already handled individually
+            handled_custom = [s for s in (self.sections_order or []) if s in self.custom_sections]
             for title, content in self.custom_sections.items():
-                content = self._substitute_variables(content, vars)
-                custom_parts.append(f"{title}:\n{content}")
-            return "\n\n".join(custom_parts)
-            
-        elif self.custom_sections and section in self.custom_sections:
-            content = self._substitute_variables(self.custom_sections[section], vars)
-            return f"{section.replace('_', ' ').title()}:\n{content}"
-            
-        return None
-    
+                 if title not in handled_custom:
+                    rendered_content = self._render_custom_section(title, content, vars)
+                    if rendered_content:
+                         custom_parts.append(rendered_content)
+            rendered_content = "\n\n".join(custom_parts) if custom_parts else None
+
+        return rendered_content
+
+
+    def _render_custom_section(self, title: str, content: Optional[str] = None, vars: Optional[Dict[str, Any]] = None) -> Optional[str]:
+         """Renders a specific custom section."""
+         vars = vars or {}
+         # Fetch content if not provided directly (e.g., called from render loop)
+         content = content or (self.custom_sections or {}).get(title)
+         if not content:
+             return None
+         # Format title nicely (e.g., 'my_section' -> '# My Section:')
+         formatted_title = title.replace('_', ' ').title()
+         content = self._substitute_variables(content, vars)
+         return f"# {formatted_title}:\n{content}"
+
+
     def _substitute_variables(self, text: str, vars: Dict[str, Any]) -> str:
         """Replace {{variable}} patterns with their values"""
         if not text:
             return ""
-        for var, value in vars.items():
-            pattern = r'\{\{\s*' + re.escape(str(var)) + r'\s*\}\}'
+        for var_name, value in vars.items():
+            # Allow whitespace around variable name: {{ var }}
+            pattern = r'\{\{\s*' + re.escape(str(var_name)) + r'\s*\}\}'
+            # Convert value to string for substitution
             text = re.sub(pattern, str(value), text)
         return text
